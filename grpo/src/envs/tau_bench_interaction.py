@@ -50,6 +50,37 @@ def _compute_binary_reward(state: dict) -> float:
     return 1.0 if state["total_reward"] >= 1.0 else 0.0
 
 
+def _replay_actions(env: Any, state: dict, replay_actions: list[dict[str, Any]]) -> None:
+    # Replay a B-NDSR checkpoint prefix into a fresh tau-bench env.
+    if not replay_actions:
+        return
+
+    from tau_bench.types import Action, RESPOND_ACTION_NAME
+
+    for replay_action in replay_actions:
+        if state.get('done', False):
+            break
+
+        kind = replay_action.get('kind')
+        if kind == 'tool':
+            action = Action(
+                name=replay_action['tool_name'],
+                kwargs=dict(replay_action.get('parameters') or {}),
+            )
+            state['num_tool_calls'] += 1
+        elif kind == 'respond':
+            action = Action(
+                name=RESPOND_ACTION_NAME,
+                kwargs={'content': replay_action.get('content', '')},
+            )
+            state['num_user_turns'] += 1
+        else:
+            raise ValueError(f'Unknown B-NDSR replay action kind: {kind}')
+
+        step_res = env.step(action)
+        state['total_reward'] += float(getattr(step_res, 'reward', 0.0))
+        if bool(getattr(step_res, 'done', False)):
+            state['done'] = True
 
 
 class TauBenchInteraction(BaseInteraction):
@@ -108,6 +139,13 @@ class TauBenchInteraction(BaseInteraction):
         env.reset(task_index=task_id_int)
 
         state = make_initial_state(task_id_int)
+        replay_actions = kwargs.get('b_ndsr_replay_actions') or []
+        if replay_actions:
+            from src.training import b_ndsr
+
+            if not b_ndsr.is_enabled():
+                raise RuntimeError('Received B-NDSR replay actions while B_NDSR_ENABLED is false.')
+            _replay_actions(env, state, replay_actions)
 
         # 关键: 绑定到当前 asyncio task 的 context
         # 同一个 coroutine 后续的 Tool.execute 会读到这里 set 的 env

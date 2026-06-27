@@ -22,6 +22,7 @@ import json
 import os
 import uuid
 from collections import defaultdict
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
@@ -525,6 +526,281 @@ class RayPPOTrainer:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
+
+    def _b_ndsr_generate_sequences(self, gen_batch: DataProto, timing_raw: dict) -> DataProto:
+        output = (
+            self.async_rollout_manager.generate_sequences(gen_batch)
+            if self.async_rollout_mode
+            else self.actor_rollout_wg.generate_sequences(gen_batch)
+        )
+        for key, value in output.meta_info.get('timing', {}).items():
+            if isinstance(value, int | float):
+                timing_raw[key] = timing_raw.get(key, 0.0) + value
+            else:
+                timing_raw[key] = value
+        output.meta_info.pop('timing', None)
+        return output
+
+    @staticmethod
+    def _b_ndsr_scores(output: DataProto) -> list[float]:
+        if output.batch is None or 'rm_scores' not in output.batch.keys():
+            raise RuntimeError('B-NDSR requires rollout rm_scores from tau-bench interaction.')
+        return output.batch['rm_scores'].sum(dim=-1).detach().cpu().tolist()
+
+    @staticmethod
+    def _b_ndsr_set_uid(data: DataProto, uid: str) -> None:
+        if 'uid' in data.non_tensor_batch:
+            data.non_tensor_batch['uid'][:] = uid
+
+    @staticmethod
+    def _b_ndsr_patch_suffix_row(
+        data: DataProto,
+        row_idx: int,
+        checkpoint: dict,
+        uid: str,
+        jass_decision: dict | None = None,
+    ) -> None:
+        import copy as _copy
+
+        data.non_tensor_batch['raw_prompt'][row_idx] = _copy.deepcopy(checkpoint['messages'])
+        if 'uid' in data.non_tensor_batch:
+            data.non_tensor_batch['uid'][row_idx] = uid
+
+        if 'extra_info' in data.non_tensor_batch:
+            extra_info = _copy.deepcopy(data.non_tensor_batch['extra_info'][row_idx])
+        else:
+            extra_info = {}
+        interaction_kwargs = _copy.deepcopy(extra_info.get('interaction_kwargs', {}))
+        interaction_kwargs['b_ndsr_replay_actions'] = _copy.deepcopy(checkpoint.get('replay_actions', []))
+        interaction_kwargs['b_ndsr_checkpoint_kind'] = checkpoint.get('kind')
+        if jass_decision is not None:
+            extra_info['jass_decision'] = _copy.deepcopy(jass_decision)
+        extra_info['interaction_kwargs'] = interaction_kwargs
+        if 'extra_info' in data.non_tensor_batch:
+            data.non_tensor_batch['extra_info'][row_idx] = extra_info
+
+        if 'interaction_kwargs' in data.non_tensor_batch:
+            data.non_tensor_batch['interaction_kwargs'][row_idx] = interaction_kwargs
+
+    @contextmanager
+    def _b_ndsr_sampling_values(self, temperature: float | None, top_p: float | None):
+        if temperature is None and top_p is None:
+            yield
+            return
+
+        rollout_config = self.config.actor_rollout_ref.rollout
+        old_temperature = rollout_config.temperature
+        old_top_p = rollout_config.top_p
+        try:
+            with open_dict(rollout_config):
+                if temperature is not None:
+                    rollout_config.temperature = float(temperature)
+                if top_p is not None:
+                    rollout_config.top_p = float(top_p)
+            yield
+        finally:
+            with open_dict(rollout_config):
+                rollout_config.temperature = old_temperature
+                rollout_config.top_p = old_top_p
+
+    @contextmanager
+    def _b_ndsr_sampling_mode(self, sampling_mode: str):
+        sampling_mode = (sampling_mode or 'normal').lower()
+        if sampling_mode == 'normal':
+            yield
+            return
+
+        rollout_config = self.config.actor_rollout_ref.rollout
+        old_temperature = rollout_config.temperature
+        old_top_p = rollout_config.top_p
+        if sampling_mode == 'explore':
+            new_temperature = float(os.getenv('JASS_EXPLORE_TEMPERATURE', '0.9'))
+            new_top_p = float(os.getenv('JASS_EXPLORE_TOP_P', '0.95'))
+        elif sampling_mode == 'conservative':
+            new_temperature = float(os.getenv('JASS_CONSERVATIVE_TEMPERATURE', '0.35'))
+            new_top_p = float(os.getenv('JASS_CONSERVATIVE_TOP_P', '0.8'))
+        else:
+            yield
+            return
+
+        try:
+            with open_dict(rollout_config):
+                rollout_config.temperature = new_temperature
+                rollout_config.top_p = new_top_p
+            yield
+        finally:
+            with open_dict(rollout_config):
+                rollout_config.temperature = old_temperature
+                rollout_config.top_p = old_top_p
+
+    def _generate_b_ndsr_groups(
+        self,
+        batch: DataProto,
+        gen_batch: DataProto,
+        timing_raw: dict,
+    ) -> tuple[DataProto, DataProto, dict[str, float]]:
+        from src.training import b_ndsr, jass
+
+        if not self.async_rollout_mode:
+            raise RuntimeError('B-NDSR suffix replay requires async agent rollout mode.')
+
+        cfg = b_ndsr.BNDSRConfig.from_env()
+        if cfg.root_min_samples <= 0 or cfg.root_max_samples < cfg.root_min_samples:
+            raise ValueError(f'Invalid B-NDSR root sample config: {cfg}')
+        if cfg.total_budget_per_task < cfg.root_max_samples:
+            raise ValueError(f'Invalid B-NDSR total budget config: {cfg}')
+
+        n_tasks = len(gen_batch)
+        root_outputs: list[list[DataProto]] = [[] for _ in range(n_tasks)]
+        root_bases: list[list[DataProto]] = [[] for _ in range(n_tasks)]
+        root_scores: list[list[float]] = [[] for _ in range(n_tasks)]
+        selected_outputs: list[DataProto] = []
+        selected_bases: list[DataProto] = []
+        pending = set(range(n_tasks))
+        metrics: dict[str, float] = {
+            'b_ndsr/enabled': 1.0,
+            'b_ndsr/root_rollouts': 0.0,
+            'b_ndsr/suffix_rollouts': 0.0,
+            'b_ndsr/root_groups': 0.0,
+            'b_ndsr/suffix_groups': 0.0,
+            'b_ndsr/skipped_easy_tasks': 0.0,
+            'b_ndsr/skipped_hard_tasks': 0.0,
+            'b_ndsr/no_checkpoint_tasks': 0.0,
+            'b_ndsr/fallback_no_signal_steps': 0.0,
+            'b_ndsr/root_temperature_sum': 0.0,
+            'b_ndsr/root_top_p_sum': 0.0,
+            'b_ndsr/root_temperature_mean': 0.0,
+            'b_ndsr/root_top_p_mean': 0.0,
+            'jass/enabled': 1.0 if jass.is_enabled() else 0.0,
+            'jass/calls': 0.0,
+            'jass/fallbacks': 0.0,
+            'jass/sampling_mode_normal': 0.0,
+            'jass/sampling_mode_explore': 0.0,
+            'jass/sampling_mode_conservative': 0.0,
+        }
+
+        def add_root_samples(task_indices: list[int], repeat_count: int) -> None:
+            if not task_indices or repeat_count <= 0:
+                return
+            base_counts = {task_idx: len(root_scores[task_idx]) for task_idx in task_indices}
+            for local_offset in range(repeat_count):
+                buckets: dict[tuple[float, float], list[int]] = defaultdict(list)
+                for task_idx in task_indices:
+                    sample_idx = base_counts[task_idx] + local_offset
+                    temperature, top_p = cfg.root_sampling_params(sample_idx)
+                    buckets[(temperature, top_p)].append(task_idx)
+
+                for (temperature, top_p), bucket_task_indices in buckets.items():
+                    input_batch = gen_batch.select_idxs(bucket_task_indices)
+                    base_batch = batch.select_idxs(bucket_task_indices)
+                    with self._b_ndsr_sampling_values(temperature, top_p):
+                        output = self._b_ndsr_generate_sequences(input_batch, timing_raw)
+                    scores = self._b_ndsr_scores(output)
+                    metrics['b_ndsr/root_rollouts'] += float(len(scores))
+                    metrics['b_ndsr/root_temperature_sum'] += float(temperature) * len(scores)
+                    metrics['b_ndsr/root_top_p_sum'] += float(top_p) * len(scores)
+                    for cursor, task_idx in enumerate(bucket_task_indices):
+                        root_outputs[task_idx].append(output.select_idxs([cursor]))
+                        root_bases[task_idx].append(base_batch.select_idxs([cursor]))
+                        root_scores[task_idx].append(scores[cursor])
+
+        def select_root_group(task_idx: int) -> None:
+            selected_outputs.append(DataProto.concat(root_outputs[task_idx]))
+            selected_bases.append(DataProto.concat(root_bases[task_idx]))
+            metrics['b_ndsr/root_groups'] += 1.0
+            pending.discard(task_idx)
+
+        def skip_task(task_idx: int, metric_name: str) -> None:
+            metrics[metric_name] += 1.0
+            pending.discard(task_idx)
+
+        def finalize_sampling_metrics() -> None:
+            root_rollouts = metrics.get('b_ndsr/root_rollouts', 0.0)
+            if root_rollouts > 0:
+                metrics['b_ndsr/root_temperature_mean'] = metrics['b_ndsr/root_temperature_sum'] / root_rollouts
+                metrics['b_ndsr/root_top_p_mean'] = metrics['b_ndsr/root_top_p_sum'] / root_rollouts
+
+        add_root_samples(list(range(n_tasks)), cfg.root_min_samples)
+        for task_idx in list(pending):
+            scores = root_scores[task_idx]
+            if b_ndsr.has_variance(scores):
+                select_root_group(task_idx)
+            elif b_ndsr.all_success(scores):
+                skip_task(task_idx, 'b_ndsr/skipped_easy_tasks')
+
+        while pending:
+            active = [idx for idx in pending if len(root_scores[idx]) < cfg.root_max_samples]
+            if not active:
+                break
+            repeat_count = min(cfg.root_increment, cfg.root_max_samples - len(root_scores[active[0]]))
+            add_root_samples(active, repeat_count)
+            for task_idx in list(active):
+                if task_idx not in pending:
+                    continue
+                scores = root_scores[task_idx]
+                if b_ndsr.has_variance(scores):
+                    select_root_group(task_idx)
+                elif b_ndsr.all_success(scores):
+                    skip_task(task_idx, 'b_ndsr/skipped_easy_tasks')
+
+        suffix_specs: list[tuple[int, dict, int, str, str, dict]] = []
+        for task_idx in list(pending):
+            scores = root_scores[task_idx]
+            if not b_ndsr.all_failure(scores):
+                skip_task(task_idx, 'b_ndsr/skipped_hard_tasks')
+                continue
+            root_group = DataProto.concat(root_outputs[task_idx])
+            traces = list(root_group.non_tensor_batch.get('b_ndsr_trace', []))
+            selected = jass.select_checkpoint(traces)
+            if selected is None:
+                skip_task(task_idx, 'b_ndsr/no_checkpoint_tasks')
+                continue
+            remaining_budget = cfg.total_budget_per_task - len(scores)
+            if remaining_budget < cfg.suffix_min_samples:
+                skip_task(task_idx, 'b_ndsr/skipped_hard_tasks')
+                continue
+            _, checkpoint, jass_decision = selected
+            used_judge = bool(jass_decision.get('used_judge', False))
+            if used_judge:
+                metrics['jass/calls'] += 1.0
+            if used_judge and jass_decision.get('fallback', False):
+                metrics['jass/fallbacks'] += 1.0
+            sampling_mode = str(jass_decision.get('sampling_mode', 'normal')).lower()
+            if f'jass/sampling_mode_{sampling_mode}' not in metrics:
+                sampling_mode = 'normal'
+            metrics[f'jass/sampling_mode_{sampling_mode}'] += 1.0
+            base_uid = str(batch.non_tensor_batch['uid'][task_idx])
+            suffix_uid = f'{base_uid}:b_ndsr_suffix:{self.global_steps}'
+            suffix_specs.append((task_idx, checkpoint, remaining_budget, suffix_uid, sampling_mode, jass_decision))
+            pending.discard(task_idx)
+
+        for task_idx, checkpoint, suffix_count, suffix_uid, sampling_mode, jass_decision in suffix_specs:
+            suffix_input = gen_batch.select_idxs([task_idx]).repeat(repeat_times=suffix_count, interleave=True)
+            suffix_base = batch.select_idxs([task_idx]).repeat(repeat_times=suffix_count, interleave=True)
+            self._b_ndsr_set_uid(suffix_base, suffix_uid)
+            for row_idx in range(suffix_count):
+                self._b_ndsr_patch_suffix_row(suffix_input, row_idx, checkpoint, suffix_uid, jass_decision)
+            with self._b_ndsr_sampling_mode(sampling_mode):
+                suffix_output = self._b_ndsr_generate_sequences(suffix_input, timing_raw)
+            suffix_scores = self._b_ndsr_scores(suffix_output)
+            metrics['b_ndsr/suffix_rollouts'] += float(len(suffix_scores))
+            if b_ndsr.has_variance(suffix_scores):
+                selected_outputs.append(suffix_output)
+                selected_bases.append(suffix_base)
+                metrics['b_ndsr/suffix_groups'] += 1.0
+            else:
+                metrics['b_ndsr/skipped_hard_tasks'] += 1.0
+
+        if selected_outputs:
+            metrics['b_ndsr/selected_rollouts'] = float(sum(len(group) for group in selected_outputs))
+            finalize_sampling_metrics()
+            return DataProto.concat(selected_bases), DataProto.concat(selected_outputs), metrics
+
+        metrics['b_ndsr/fallback_no_signal_steps'] = 1.0
+        fallback_task = 0
+        metrics['b_ndsr/selected_rollouts'] = float(len(root_outputs[fallback_task]))
+        finalize_sampling_metrics()
+        return DataProto.concat(root_bases[fallback_task]), DataProto.concat(root_outputs[fallback_task]), metrics
 
     def _validate(self):
         data_source_lst = []
@@ -1089,22 +1365,38 @@ class RayPPOTrainer:
                 gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
+                gen_batch.meta_info['global_steps'] = self.global_steps
+                from src.training import b_ndsr as b_ndsr_module
+
+                b_ndsr_enabled = b_ndsr_module.is_enabled()
+                if b_ndsr_enabled and self.config.algorithm.adv_estimator != AdvantageEstimator.GRPO:
+                    raise RuntimeError('B-NDSR is only supported with GRPO advantage estimation.')
+                if not b_ndsr_enabled:
+                    gen_batch_output = gen_batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                    )
+                else:
+                    gen_batch_output = None
+
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
-                    with marked_timer("gen", timing_raw, color="red"):
-                        if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                    with marked_timer('gen', timing_raw, color='red'):
+                        if b_ndsr_enabled:
+                            batch, gen_batch_output, b_ndsr_metrics = self._generate_b_ndsr_groups(
+                                batch, gen_batch, timing_raw
+                            )
+                            metrics.update(b_ndsr_metrics)
                         else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                            if not self.async_rollout_mode:
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                            else:
+                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                            timing_raw.update(gen_batch_output.meta_info['timing'])
+                            gen_batch_output.meta_info.pop('timing', None)
+
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1135,7 +1427,8 @@ class RayPPOTrainer:
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    if not b_ndsr_enabled:
+                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():

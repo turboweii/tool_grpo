@@ -25,8 +25,7 @@ from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.experimental.agent_loop.utils import add_generation_prompt_for_gpt_oss, format_gpt_oss_tool_response_manually
 from verl.interactions.base import BaseInteraction
 
-# [W5 PRM-Lite] 导入 assistant content 记录函数
-from src.envs.tau_bench_interaction import record_assistant_content
+from src.training import b_ndsr
 from verl.interactions.utils.interaction_registry import initialize_interactions_from_config
 from verl.tools.schemas import ToolResponse
 from verl.tools.utils.tool_registry import initialize_tools_from_config
@@ -81,6 +80,24 @@ class AgentData:
 
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
+
+        # B-NDSR tracing is opt-in and only consumed when B_NDSR_ENABLED=true.
+        self.b_ndsr_enabled = b_ndsr.is_enabled()
+        self.b_ndsr_replay_actions: list[dict[str, Any]] = []
+        self.b_ndsr_checkpoints: list[dict[str, Any]] = []
+        self.b_ndsr_flags: dict[str, Any] = {
+            'json_error': False,
+            'invalid_tool_name': False,
+            'tool_execution_error': False,
+            'early_final_answer': False,
+            'repeated_tool_loop': False,
+            'write_executed': False,
+            'read_count': 0,
+            'distinct_read_tools': [],
+            'valid_tool_calls': 0,
+            'has_key_entity': False,
+        }
+        self.b_ndsr_tool_sigs: list[tuple[str, str]] = []
 
 
 @register("tool_agent")
@@ -213,6 +230,11 @@ class ToolAgentLoop(AgentLoopBase):
         })
         if conditional_prm_info:
             output.extra_fields.update(conditional_prm_info)
+        if agent_data.b_ndsr_enabled:
+            output.extra_fields['b_ndsr_trace'] = {
+                'checkpoints': agent_data.b_ndsr_checkpoints,
+                'flags': agent_data.b_ndsr_flags,
+            }
         return output
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
@@ -280,13 +302,37 @@ class ToolAgentLoop(AgentLoopBase):
             assistant_message = await self.loop.run_in_executor(
                 None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
             )
-            add_messages.append({"role": "assistant", "content": assistant_message})
+            if agent_data.b_ndsr_enabled:
+                pre_messages = copy.deepcopy(agent_data.messages)
+                pre_actions = copy.deepcopy(agent_data.b_ndsr_replay_actions)
+                if agent_data.tool_calls:
+                    for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
+                        if tool_call.name not in self.tools:
+                            agent_data.b_ndsr_flags['invalid_tool_name'] = True
+                        if tool_call.name in b_ndsr.WRITE_TOOLS:
+                            agent_data.b_ndsr_checkpoints.append(
+                                b_ndsr.make_checkpoint(
+                                    kind='before_write_tool',
+                                    messages=pre_messages,
+                                    replay_actions=pre_actions,
+                                    turn_idx=agent_data.assistant_turns,
+                                    tool_name=tool_call.name,
+                                    features={
+                                        'read_count': agent_data.b_ndsr_flags.get('read_count', 0),
+                                        'valid_tool_calls': agent_data.b_ndsr_flags.get('valid_tool_calls', 0),
+                                    },
+                                )
+                            )
+                elif (
+                    agent_data.assistant_turns <= 2
+                    and int(agent_data.b_ndsr_flags.get('read_count', 0)) == 0
+                    and assistant_message.strip()
+                ):
+                    agent_data.b_ndsr_flags['early_final_answer'] = True
+            add_messages.append({'role': 'assistant', 'content': assistant_message})
             agent_data.messages.extend(add_messages)
             # [W5] 记录每轮 assistant content 的 token 数，用于监控 reasoning 退化
             agent_data.reasoning_tokens_per_turn.append(len(agent_data.response_ids))
-            # [W5 PRM-Lite] 记录当前 turn 的 assistant content，供 tool.execute 读取
-            if agent_data.tool_calls:
-                record_assistant_content(assistant_message)
 
         # Determine next state
         if agent_data.tool_calls:
@@ -313,29 +359,89 @@ class ToolAgentLoop(AgentLoopBase):
         # Process tool responses and update multi_modal_data
         # Removed: agent_data.new_images_this_turn = []
         agent_data.total_tool_calls += len(agent_data.tool_calls)
-        for tool_response, tool_reward, _ in responses:
-            if tool_response.text and tool_response.text.startswith("Error:"):
+        after_read_checkpoint_tool = None
+        for tool_call, (tool_response, tool_reward, _) in zip(
+            agent_data.tool_calls[: self.max_parallel_calls], responses, strict=True
+        ):
+            tool_text = tool_response.text or ''
+            tool_error = tool_text.startswith('Error:')
+            if tool_error:
                 agent_data.total_errors += 1
+
+            if agent_data.b_ndsr_enabled:
+                flags = agent_data.b_ndsr_flags
+                parsed_args = {}
+                args_ok = True
+                try:
+                    parsed_args = json.loads(tool_call.arguments)
+                except Exception:
+                    flags['json_error'] = True
+                    args_ok = False
+
+                valid_name = tool_call.name in self.tools
+                if not valid_name:
+                    flags['invalid_tool_name'] = True
+                if tool_error:
+                    flags['tool_execution_error'] = True
+
+                if args_ok and valid_name and not tool_error:
+                    agent_data.b_ndsr_replay_actions.append(
+                        b_ndsr.make_replay_action(
+                            'tool',
+                            tool_name=tool_call.name,
+                            parameters=parsed_args,
+                        )
+                    )
+                    flags['valid_tool_calls'] = int(flags.get('valid_tool_calls', 0)) + 1
+                    sig = (tool_call.name, json.dumps(parsed_args, sort_keys=True, ensure_ascii=False))
+                    agent_data.b_ndsr_tool_sigs.append(sig)
+                    if agent_data.b_ndsr_tool_sigs.count(sig) >= 3:
+                        flags['repeated_tool_loop'] = True
+
+                    if tool_call.name in b_ndsr.READ_TOOLS:
+                        flags['read_count'] = int(flags.get('read_count', 0)) + 1
+                        distinct_reads = list(flags.get('distinct_read_tools', []) or [])
+                        if tool_call.name not in distinct_reads:
+                            distinct_reads.append(tool_call.name)
+                        flags['distinct_read_tools'] = distinct_reads
+                        lowered_text = tool_text.lower()
+                        if any(
+                            marker in lowered_text
+                            for marker in (
+                                'reservation',
+                                'passenger',
+                                'flight',
+                                'user',
+                                'airport',
+                                'payment',
+                                'baggage',
+                            )
+                        ):
+                            flags['has_key_entity'] = True
+                        after_read_checkpoint_tool = tool_call.name
+                    elif tool_call.name in b_ndsr.WRITE_TOOLS:
+                        flags['write_executed'] = True
+
             # Create message from tool response
             if tool_response.image or tool_response.video:
                 # Multi-modal content with structured format
-                if not getattr(self.processor, "image_processor", None):
+                if not getattr(self.processor, 'image_processor', None):
                     raise ValueError(
-                        "Multimedia data can only be processed by `processor`, but the processor is None. "
-                        "This error is often caused if you are using a LLM model but your tool returns multimodal "
-                        "data. Plase use a vlm as the base model."
+                        'Multimedia data can only be processed by processor, but the processor is None. '
+                        'This error is often caused if you are using a LLM model but your tool returns multimodal '
+                        'data. Plase use a vlm as the base model.'
                     )
                 content = []
                 if tool_response.image:
-                    content.append({"type": "image"})
+                    content.append({'type': 'image'})
                 if tool_response.video:
-                    content.append({"type": "video"})
+                    content.append({'type': 'video'})
                 if tool_response.text:
-                    content.append({"type": "text", "text": tool_response.text})
-                message = {"role": "tool", "content": content}
+                    content.append({'type': 'text', 'text': tool_response.text})
+                message = {'role': 'tool', 'content': content}
             else:
                 # Text-only content
-                message = {"role": "tool", "content": tool_response.text or ""}
+                message = {'role': 'tool', 'content': tool_text}
 
             add_messages.append(message)
 
@@ -355,15 +461,30 @@ class ToolAgentLoop(AgentLoopBase):
             # Handle video data
             if tool_response.video:
                 # Currently not supported, raise informative error
-                logger.warning("Multimedia type 'video' is not currently supported. Only 'image' is supported.")
+                logger.warning('Multimedia type video is not currently supported. Only image is supported.')
                 raise NotImplementedError(
-                    "Multimedia type 'video' is not currently supported. Only 'image' is supported."
+                    'Multimedia type video is not currently supported. Only image is supported.'
                 )
 
             if tool_reward is not None:
                 agent_data.tool_rewards.append(tool_reward)
 
         agent_data.messages.extend(add_messages)
+        if agent_data.b_ndsr_enabled and after_read_checkpoint_tool is not None:
+            agent_data.b_ndsr_checkpoints.append(
+                b_ndsr.make_checkpoint(
+                    kind='after_read_tool',
+                    messages=agent_data.messages,
+                    replay_actions=agent_data.b_ndsr_replay_actions,
+                    turn_idx=agent_data.assistant_turns,
+                    tool_name=after_read_checkpoint_tool,
+                    features={
+                        'read_count': agent_data.b_ndsr_flags.get('read_count', 0),
+                        'valid_tool_calls': agent_data.b_ndsr_flags.get('valid_tool_calls', 0),
+                        'has_key_entity': agent_data.b_ndsr_flags.get('has_key_entity', False),
+                    },
+                )
+            )
         # Update prompt with tool responses
         if self.processor is not None:
             raw_tool_response = await self.loop.run_in_executor(
@@ -420,6 +541,12 @@ class ToolAgentLoop(AgentLoopBase):
 
     async def _handle_interacting_state(self, agent_data: AgentData) -> AgentState:
         """Handle the interacting state: get user input from interaction."""
+        assistant_content = ''
+        if agent_data.b_ndsr_enabled:
+            for message in reversed(agent_data.messages):
+                if isinstance(message, dict) and message.get('role') == 'assistant':
+                    assistant_content = message.get('content', '') or ''
+                    break
         (
             should_terminate_sequence,
             interaction_responses,
@@ -429,6 +556,10 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.request_id, agent_data.messages, **agent_data.interaction_kwargs
         )
         agent_data.user_turns += 1
+        if agent_data.b_ndsr_enabled:
+            agent_data.b_ndsr_replay_actions.append(
+                b_ndsr.make_replay_action('respond', content=assistant_content)
+            )
 
         add_messages: list[dict[str, Any]] = [{"role": "user", "content": interaction_responses}]
         agent_data.messages.extend(add_messages)

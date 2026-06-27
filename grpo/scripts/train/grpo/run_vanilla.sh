@@ -23,6 +23,23 @@ export SWANLAB_RESUME="true"
 # expandable_segments disabled: incompatible with vLLM memory pool
 # export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
+export B_NDSR_ENABLED="${B_NDSR_ENABLED:-false}"
+export B_NDSR_ROOT_TEMPERATURES="${B_NDSR_ROOT_TEMPERATURES:-0.45,0.65,0.80,0.95,0.55,1.00,0.70,1.05}"
+export B_NDSR_ROOT_TOP_PS="${B_NDSR_ROOT_TOP_PS:-0.85,0.90,0.92,0.95,0.88,0.96,0.90,0.97}"
+export JASS_ENABLED="${JASS_ENABLED:-false}"
+export JASS_JUDGE_MODEL="${JASS_JUDGE_MODEL:-Qwen/Qwen2.5-72B-Instruct-AWQ}"
+export JASS_JUDGE_BASE_URL="${JASS_JUDGE_BASE_URL:-http://localhost:8001/v1}"
+B_NDSR_EXTRA_ARGS=()
+case "${B_NDSR_ENABLED,,}" in
+    1|true|yes|y|on)
+        B_NDSR_EXTRA_ARGS+=(actor_rollout_ref.rollout.n=1)
+        B_NDSR_EXTRA_ARGS+=(actor_rollout_ref.actor.ppo_mini_batch_size=2)
+        B_NDSR_EXTRA_ARGS+=(actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1)
+        B_NDSR_EXTRA_ARGS+=(actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1)
+        B_NDSR_EXTRA_ARGS+=(trainer.experiment_name=vanilla_grpo_b_ndsr)
+        ;;
+esac
+
 cd /workspace/grpo
 mkdir -p experiments/vanilla
 
@@ -34,4 +51,5 @@ mkdir -p experiments/vanilla
 
 python -m verl.trainer.main_ppo \
     --config-path=$(pwd)/configs \
-    --config-name=vanilla_grpo
+    --config-name=vanilla_grpo \
+    "${B_NDSR_EXTRA_ARGS[@]}"
