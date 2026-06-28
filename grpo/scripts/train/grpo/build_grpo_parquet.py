@@ -7,9 +7,8 @@ Usage:
         --output-train experiments/vanilla/train.parquet \
         --output-val experiments/vanilla/val.parquet
 
-Design: patch v2 §3.4
-- Each row = one task, rollout.n=4 expands at runtime by veRL
-- prompt column: only system message (date grounding), user msg from Interaction
+- Each row = one task, rollout.n expands at runtime by veRL
+- prompt column: system message (airline wiki + date grounding), user msg from Interaction
 - extra_info: index, task_id, split, interaction_kwargs
 - No traj_uid column (veRL repeat mechanism makes it non-unique)
 """
@@ -27,12 +26,16 @@ while not (PROJECT_ROOT / "src").is_dir():
     PROJECT_ROOT = PROJECT_ROOT.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-SYSTEM_PROMPT = (
-    "# Current Date Context\n"
+# Airline policy wiki = the agent's system prompt (refund/cancellation/baggage/
+# basic-economy/insurance/certificate rules). tau-bench does NOT return it from
+# env.reset() (only the user's first message), so inject it here -- otherwise the
+# policy never sees the domain rules and has to guess.
+from tau_bench.envs.airline.wiki import WIKI
+
+SYSTEM_PROMPT = WIKI + "\n\n" + (
+    "# Date Context\n"
     "The current date is 2024-05-15 (Wednesday). "
-    "When users mention dates without specifying the year, "
-    "always assume they refer to 2024. "
-    "All flight searches and reservations should use 2024 dates unless explicitly stated otherwise."
+    "When the user mentions a date without a year, interpret it as 2024."
 )
 
 INTERACTION_NAME = "tau_bench_airline"

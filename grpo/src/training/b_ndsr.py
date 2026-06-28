@@ -36,6 +36,27 @@ WRITE_TOOLS = frozenset(
 )
 
 
+
+
+def env_tool_set(name: str, default: frozenset[str]) -> frozenset[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    if raw.strip() == '':
+        return frozenset()
+    values = {part.strip() for part in raw.split(',') if part.strip()}
+    return frozenset(values)
+
+
+def is_read_tool(tool_name: str) -> bool:
+    tools = env_tool_set('B_NDSR_READ_TOOLS', READ_TOOLS)
+    return '*' in tools or tool_name in tools
+
+
+def is_write_tool(tool_name: str) -> bool:
+    tools = env_tool_set('B_NDSR_WRITE_TOOLS', WRITE_TOOLS)
+    return '*' in tools or tool_name in tools
+
 def env_flag(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:

@@ -1,11 +1,11 @@
 """
-Day 3-4: LoRA SFT 训练
+LoRA SFT 训练
 基于 transformers + peft，不直接用 TRL SFTTrainer
 理由：TRL SFTTrainer 对 multi-turn + tool_calls 的 loss mask 处理是黑盒，
 我们自己的 TrajectorySFTDataset 已经把 labels 算好了，直接用 HF Trainer 就行。
 
 关键设计:
-1. LoRA r=16, alpha=32（PROJECT.md §2.3 规定）
+1. LoRA r=16, alpha=32
 2. target_modules 覆盖 q_proj, k_proj, v_proj, o_proj + gate/up/down_proj
    （Qwen2.5 全 linear，比只跑 attn 效果好）
 3. bf16 训练（A800 / 4090 都支持）
@@ -57,7 +57,7 @@ def main():
         cfg["model"]["name_or_path"], trust_remote_code=True
     )
     if tokenizer.pad_token_id is None:
-        # PROJECT.md §2.1 历史踩坑：Qwen 的 pad_token 必须显式设
+        # Qwen 的 pad_token 必须显式设（否则 pad_token_id 为 None）
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     # Qwen 的 padding_side 训练时用 right

@@ -1,0 +1,7 @@
+interaction:
+  - name: "bfcl_v4_multi_turn"
+    class_name: "src.envs.bfcl_interaction.BFCLInteraction"
+    config:
+      categories:
+        - "multi_turn_base"
+      max_turns: 30

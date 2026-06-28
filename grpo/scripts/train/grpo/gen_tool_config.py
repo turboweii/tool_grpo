@@ -6,7 +6,7 @@ Usage:
         --env airline \
         --output configs/tool_config/tau_bench_airline_tools.yaml
 
-Design: §4.1 — dynamic generation, not hand-written.
+Dynamic generation from env.tools_info (not hand-written).
 Produces one entry per tool with class_name pointing to the dynamically
 generated TauBench_<name>_Tool class in srcs.evns.tau_bench_tools.
 """

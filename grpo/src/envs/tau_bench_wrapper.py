@@ -119,22 +119,18 @@ class TauBenchWrapper:
         # 这导致 search_direct_flight/search_onestop_flight 永远返回 []。
         # 注入一条 system message 强制锚定当前日期为 2024-05-15。
         
-        if self.env_name == "retail":
-            system_content = (
-                "# Current Date Context\n"
-                "The current date is 2024-05-15 (Wednesday). "
-                "When users mention dates without specifying the year, "
-                "always assume they refer to 2024. "
-                "All product orders and exchanges should use 2024 dates unless explicitly stated otherwise."
-            )
-        else:
-            system_content = (
-                "# Current Date Context\n"
-                "The current date is 2024-05-15 (Wednesday). "
-                "When users mention dates without specifying the year, "
-                "always assume they refer to 2024. "
-                "All flight searches and reservations should use 2024 dates unless explicitly stated otherwise."
-            )
+        # Date grounding: Qwen2.5 defaults year-less dates to 2023, but tau-bench
+        # data is 2024 -> pin the year. Domain policy (airline/retail) now comes
+        # from env.wiki prepended above, so this stays short and domain-agnostic.
+        system_content = (
+            "# Date Context\n"
+            "The current date is 2024-05-15 (Wednesday). "
+            "When the user mentions a date without a year, interpret it as 2024."
+        )
+        # Prepend the domain policy wiki (env.wiki) -- it is the agent's system
+        # prompt (refund/cancellation/baggage/... rules). tau-bench reset() only
+        # returns the user's first message, not the policy, so inject it here.
+        system_content = env.wiki + "\n\n" + system_content
         messages = [
             {"role": "system", "content": system_content},
             {"role": "user", "content": str(obs_res.observation)},

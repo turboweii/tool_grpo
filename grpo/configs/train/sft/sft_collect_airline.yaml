@@ -1,4 +1,4 @@
-# Day 1-2: SFT 数据采集配置
+# SFT 数据采集配置
 # 双卡 A800 分离部署：
 #   - GPU 0 (port 8000): 72B-AWQ 当 policy 跑 trajectory
 #   - GPU 1 (port 8001): 72B-AWQ 当 user simulator

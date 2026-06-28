@@ -46,7 +46,7 @@ def _extract_latest_assistant_content(messages: list[dict]) -> str:
 
 
 def _compute_binary_reward(state: dict) -> float:
-    """W3 原始: outcome >= 1.0 → 1, 否则 0"""
+    """Binary outcome: reward 1.0 if total_reward >= 1.0 else 0.0."""
     return 1.0 if state["total_reward"] >= 1.0 else 0.0
 
 
@@ -179,7 +179,7 @@ class TauBenchInteraction(BaseInteraction):
         """
         entry = self._instance_dict.get(instance_id)
         if entry is None:
-            # 【修订 1】Fail loud: start_interaction 必须先于 generate_response,
+            # Fail loud: start_interaction 必须先于 generate_response,
             # 不满足说明 ToolAgentLoop 生命周期被破坏,继续跑会产生带毒 trajectory
             raise RuntimeError(
                 f"[CRITICAL] TauBenchInteraction.generate_response called for "
@@ -192,14 +192,17 @@ class TauBenchInteraction(BaseInteraction):
         env = entry["env"]
         state = entry["state"]
 
-        # Defensive re-set: ToolAgentLoop 的状态机在同一个 coroutine 内顺序执行,
-        # 理论上 start_interaction 里 set 的值一直有效,但重新 set 一遍无副作用。
-        CURRENT_TAU_ENV.set(env)
-        CURRENT_TAU_STATE.set(state)
+        # No contextvar re-set here: veRL runs each trajectory in its own asyncio
+        # task (agent_loop.create_task per trajectory -> context fork), so the
+        # CURRENT_TAU_ENV/STATE set in start_interaction stays visible throughout
+        # this task. tool.execute (same task, not a run_in_executor thread) reads
+        # them correctly -- re-setting the same dict reference would be a no-op.
+        # CAUTION: never move tool.execute / env.step into run_in_executor --
+        # executor threads do NOT inherit asyncio contextvars; isolation would break.
 
         assistant_content = _extract_latest_assistant_content(messages)
 
-        # 污染检测: 锁定 reward=0 + terminate(§3.3)
+        # 污染检测: 锁定 reward=0 + terminate
         if _has_forbidden_token(assistant_content):
             state["contaminated"] = True
             state["done"] = True

@@ -25,7 +25,7 @@ from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.experimental.agent_loop.utils import add_generation_prompt_for_gpt_oss, format_gpt_oss_tool_response_manually
 from verl.interactions.base import BaseInteraction
 
-from src.training import b_ndsr
+from src.training import b_ndsr, llm_judge
 from verl.interactions.utils.interaction_registry import initialize_interactions_from_config
 from verl.tools.schemas import ToolResponse
 from verl.tools.utils.tool_registry import initialize_tools_from_config
@@ -123,7 +123,7 @@ class ToolAgentLoop(AgentLoopBase):
         cls.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
         cls.tool_parser = ToolParser.get_tool_parser(config.actor_rollout_ref.rollout.multi_turn.format, cls.tokenizer)
         cls.tool_parser_name = config.actor_rollout_ref.rollout.multi_turn.format
-        # W4: 禁用裸 print，避免每次 worker 启动时打印完整 tools dict 导致日志膨胀
+        # 禁用裸 print，避免每次 worker 启动时打印完整 tools dict 导致日志膨胀
         # print(f"Initialized tools: {cls.tools}")
         pass
 
@@ -235,6 +235,8 @@ class ToolAgentLoop(AgentLoopBase):
                 'checkpoints': agent_data.b_ndsr_checkpoints,
                 'flags': agent_data.b_ndsr_flags,
             }
+        if llm_judge.is_enabled():
+            output.extra_fields["llm_judge_messages"] = copy.deepcopy(agent_data.messages)
         return output
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
@@ -309,7 +311,7 @@ class ToolAgentLoop(AgentLoopBase):
                     for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
                         if tool_call.name not in self.tools:
                             agent_data.b_ndsr_flags['invalid_tool_name'] = True
-                        if tool_call.name in b_ndsr.WRITE_TOOLS:
+                        if b_ndsr.is_write_tool(tool_call.name):
                             agent_data.b_ndsr_checkpoints.append(
                                 b_ndsr.make_checkpoint(
                                     kind='before_write_tool',
@@ -331,7 +333,7 @@ class ToolAgentLoop(AgentLoopBase):
                     agent_data.b_ndsr_flags['early_final_answer'] = True
             add_messages.append({'role': 'assistant', 'content': assistant_message})
             agent_data.messages.extend(add_messages)
-            # [W5] 记录每轮 assistant content 的 token 数，用于监控 reasoning 退化
+            # 记录每轮 assistant content 的 token 数，用于监控 reasoning 退化
             agent_data.reasoning_tokens_per_turn.append(len(agent_data.response_ids))
 
         # Determine next state
@@ -398,7 +400,7 @@ class ToolAgentLoop(AgentLoopBase):
                     if agent_data.b_ndsr_tool_sigs.count(sig) >= 3:
                         flags['repeated_tool_loop'] = True
 
-                    if tool_call.name in b_ndsr.READ_TOOLS:
+                    if b_ndsr.is_read_tool(tool_call.name):
                         flags['read_count'] = int(flags.get('read_count', 0)) + 1
                         distinct_reads = list(flags.get('distinct_read_tools', []) or [])
                         if tool_call.name not in distinct_reads:
@@ -419,7 +421,7 @@ class ToolAgentLoop(AgentLoopBase):
                         ):
                             flags['has_key_entity'] = True
                         after_read_checkpoint_tool = tool_call.name
-                    elif tool_call.name in b_ndsr.WRITE_TOOLS:
+                    elif b_ndsr.is_write_tool(tool_call.name):
                         flags['write_executed'] = True
 
             # Create message from tool response

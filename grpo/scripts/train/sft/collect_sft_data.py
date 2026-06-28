@@ -1,12 +1,10 @@
 """
-Day 1-2: 用 Qwen2.5-72B-Instruct-AWQ 在 τ-bench airline 上 best-of-N 采集 SFT 数据
+用 Qwen2.5-72B-Instruct-AWQ 在 τ-bench airline 上 best-of-N 采集 SFT 数据
 
-设计思路（对应 PROJECT.md §3 + §6.4 复用约定）:
+设计思路:
 1. 72B-AWQ 此时不再当 user simulator，而是当 policy 跑 trajectory 采集
    user simulator 仍然用 72B-AWQ（同一个 server，复用 8001 端口）
-2. 每个 task 跑 best_of=16 次:
-   - 第 1 次 temp=0.0 greedy（保证至少有一条最稳定的 trajectory）
-   - 第 2-16 次 temp=0.8 多样化采样
+2. 每个 task 跑 best_of=16 次（分层温度：0.0/0.5/0.8/1.0 各 4 条）
 3. 过滤策略 (a)：只保留 success=True 的 trajectory
 4. 过滤策略 (b)：被截断污染的 trajectory 进 contaminated 桶，永不进 train.jsonl
 5. 断点续跑：每个 task 一个 jsonl，文件存在则跳过

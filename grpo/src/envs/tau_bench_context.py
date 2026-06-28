@@ -1,13 +1,13 @@
 """
 Per-trajectory 共享的 context 变量,用于 TauBenchTool 和 TauBenchInteraction 之间传递 env 实例。
 
-设计要点(见 design doc §2.4 / §3.3):
+设计要点:
 - veRL ToolAgentLoop 为每条 trajectory 用 asyncio.create_task 创建独立 coroutine
 - asyncio 会为每个 task fork 一份 context,contextvar 修改互不干扰
 - 同一条 trajectory 内,Interaction.start_interaction 先 set,后续 Tool.execute 在同一个 task 里读取
 - group_size=G 下 G 条同 task_id 的 rollout 各自 set 一个 env 实例,天然隔离
 
-已实地验证(见 design doc §3.3.2 测试代码)。
+已实地验证。
 """
 from __future__ import annotations
 

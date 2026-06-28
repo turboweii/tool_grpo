@@ -1,5 +1,4 @@
 # Mock GRPO (5 step) — pipeline validation
-# Design: §4.3
 # Run: bash scripts/train/mock/run_vanilla_grpo_mock.sh
 hydra:
   searchpath:

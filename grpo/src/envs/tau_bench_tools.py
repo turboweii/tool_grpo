@@ -1,13 +1,13 @@
 """
 TauBenchToolBase + 14 个 τ-bench airline tool 的静态子类。
 
-设计要点(见 design doc §3.1,已根据 review 修订):
+设计要点:
 - 14 个独立子类,veRL 按 class_name 实例化时一个 schema 对应一个类
 - 静态定义在本文件中,避免 cloudpickle 序列化动态类的坑(Ray/FSDP 多进程场景)
 - 启动时有一致性校验: verify_tool_classes_match_env() 检查静态类名与 env.tools_info 完全对齐
 - Tool 本身 stateless, env 通过 contextvar 从当前 asyncio task 获取
 
-关键修订(相对初稿):
+关键设计:
 1. 动态 type() 生成 → 静态 class 定义(pickle-safe)
 2. "no env in context" 从返回错误字符串 → raise RuntimeError(fail loud)
 3. Tool error 格式 "[TOOL_ERROR] XXX" → "Error: XXX"(对齐 τ-bench 原生)
@@ -70,7 +70,7 @@ class TauBenchToolBase(BaseTool):
         env = CURRENT_TAU_ENV.get()
         state = CURRENT_TAU_STATE.get()
 
-        # 【修订 1】Fail loud: 宁可整个 batch 崩,也不让带毒 trajectory 进 GRPO
+        # Fail loud: 宁可整个 batch 崩,也不让带毒 trajectory 进 GRPO
         if env is None or state is None:
             raise RuntimeError(
                 f"[CRITICAL] TauBench env/state missing from contextvar for tool "
@@ -87,7 +87,7 @@ class TauBenchToolBase(BaseTool):
             step_res = env.step(action)
         except Exception as e:
             # env.step 自身异常(参数 schema 不匹配 / env 已 done 被再 step / 等)
-            # 【修订 3】Error 格式对齐 τ-bench 原生: 一句自然语言,无前缀
+            # Error 格式对齐 τ-bench 原生: 一句自然语言,无前缀
             # (τ-bench 自己的 tool error 样例: "Unknown action update_reservation_insurance")
             err_msg = f"Error: {type(e).__name__}: {e}"
             logger.warning(f"[Tool.execute] {self.name} raised: {err_msg}")

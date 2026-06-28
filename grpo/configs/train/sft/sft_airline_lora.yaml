@@ -1,5 +1,5 @@
-# Day 3-4: LoRA SFT 训练配置
-# 参考 PROJECT.md §2.3: r=16, alpha=32, lr=1e-4, 3 epoch
+# LoRA SFT 训练配置
+# LoRA: r=16, alpha=32, lr=1e-4, 3 epoch
 
 model:
   name_or_path: "../models/Qwen2.5-7B-Instruct"  # 本地路径，跟 vLLM server 一致

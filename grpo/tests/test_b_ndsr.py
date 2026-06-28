@@ -268,6 +268,15 @@ def test_is_enabled_env_flag():
     os.environ.pop("B_NDSR_ENABLED", None)
 
 
+
+def test_env_tool_set_empty_means_no_tools():
+    os.environ["B_NDSR_WRITE_TOOLS"] = ""
+    assert b_ndsr.env_tool_set("B_NDSR_WRITE_TOOLS", b_ndsr.WRITE_TOOLS) == frozenset()
+    assert b_ndsr.is_write_tool("book_reservation") is False
+    os.environ["B_NDSR_WRITE_TOOLS"] = "*"
+    assert b_ndsr.is_write_tool("anything") is True
+    os.environ.pop("B_NDSR_WRITE_TOOLS", None)
+
 # --------------------------------------------------------------------------- #
 # Standalone runner (no pytest required)
 # --------------------------------------------------------------------------- #

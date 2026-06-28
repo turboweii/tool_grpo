@@ -1,7 +1,7 @@
 """
 SFT Dataset: 把 OpenAI 格式的 multi-turn trajectory 转成 Qwen2.5 训练样本
 
-核心难点 (PROJECT.md §3 关键风险第 3 条):
+核心难点:
 - 多轮对话里只在 assistant turn 算 loss，user/system/tool turn 全部 mask 掉
 - 包括 assistant 的 tool_calls 部分（Qwen 渲染成 <tool_call>...</tool_call>），也要算 loss
 - 不能简单按 token "user/assistant/system" 字符串切分，因为 Qwen2.5 chat template

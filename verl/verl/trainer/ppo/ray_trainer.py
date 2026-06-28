@@ -573,6 +573,7 @@ class RayPPOTrainer:
         interaction_kwargs = _copy.deepcopy(extra_info.get('interaction_kwargs', {}))
         interaction_kwargs['b_ndsr_replay_actions'] = _copy.deepcopy(checkpoint.get('replay_actions', []))
         interaction_kwargs['b_ndsr_checkpoint_kind'] = checkpoint.get('kind')
+        interaction_kwargs['b_ndsr_checkpoint_messages'] = _copy.deepcopy(checkpoint.get('messages', []))
         if jass_decision is not None:
             extra_info['jass_decision'] = _copy.deepcopy(jass_decision)
         extra_info['interaction_kwargs'] = interaction_kwargs
@@ -912,7 +913,7 @@ class RayPPOTrainer:
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
-            # [W5] Collect custom rollout metrics for validation
+            # Collect custom rollout metrics for validation
             if "reasoning_tokens_per_turn" in test_batch.non_tensor_batch:
                 for rtpt in test_batch.non_tensor_batch["reasoning_tokens_per_turn"]:
                     if rtpt and len(rtpt) > 0:
@@ -969,7 +970,7 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
-        # [W5] Custom rollout metrics: reasoning tokens, tool calls, errors, PRM decomposition
+        # Custom rollout metrics: reasoning tokens, tool calls, errors
         if sample_reasoning_tokens:
             metric_dict["val-aux/reasoning_tokens_per_turn/mean"] = float(np.mean(sample_reasoning_tokens))
             metric_dict["val-aux/reasoning_tokens_per_turn/max"] = int(np.max(sample_reasoning_tokens))
@@ -997,7 +998,7 @@ class RayPPOTrainer:
                     metric_dict[f"val-core/split_{split}/reward/mean@{n_val}"] = float(split_scores.mean())
                     metric_dict[f"val-core/split_{split}/reward/std@{n_val}"] = float(split_scores.std())
                     metric_dict[f"val-aux/split_{split}/count@{n_val}"] = int(mask.sum())
-                    # [W5] Per-split PRM decomposition
+                    # Per-split outcome/process breakdown
                     if sample_outcome_rewards and len(sample_outcome_rewards) == len(sample_scores):
                         metric_dict[f"val-core/split_{split}/outcome_reward/mean@{n_val}"] = float(np.mean(np.array(sample_outcome_rewards)[mask]))
                     if sample_process_scores and len(sample_process_scores) == len(sample_scores):
@@ -1430,9 +1431,19 @@ class RayPPOTrainer:
                     if not b_ndsr_enabled:
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
-
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    # Optional judge densification: independent of B-NDSR. Runs after rollout
+                    # (whichever path produced the batch). If B-NDSR is on it already chose the
+                    # trainable group using tau-bench 0/1 rewards; the judge only reshapes rewards
+                    # -- it never touches grouping or the binary outcome.
+                    from src.training import llm_judge
+
+                    if llm_judge.is_enabled():
+                        batch, judge_metrics = llm_judge.densify_rewards(batch, gen_batch_output)
+                        metrics.update(judge_metrics)
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
